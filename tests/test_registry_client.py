@@ -1,3 +1,6 @@
+import hashlib
+import tempfile
+
 import pytest
 from registry_mirror.registry_client import parse_image_name
 
@@ -181,3 +184,32 @@ class TestFetchManifest:
         client = RegistryClient()
         with pytest.raises(ValueError, match="平台"):
             client.fetch_manifest("registry-1.docker.io", "library/nginx", "latest", platform="linux/arm64")
+
+
+class TestDownloadBlob:
+    def test_download_blob_to_file(self, requests_mock):
+        from registry_mirror.registry_client import RegistryClient
+        content = b"test layer content"
+        digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        requests_mock.get(
+            f"https://registry-1.docker.io/v2/library/nginx/blobs/{digest}",
+            content=content,
+        )
+        client = RegistryClient()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = client.download_blob("registry-1.docker.io", "library/nginx", digest, tmpdir)
+            with open(filepath, "rb") as f:
+                assert f.read() == content
+
+    def test_download_blob_digest_mismatch(self, requests_mock):
+        from registry_mirror.registry_client import RegistryClient, DigestMismatchError
+        content = b"test layer content"
+        wrong_digest = "sha256:" + "0" * 64
+        requests_mock.get(
+            f"https://registry-1.docker.io/v2/library/nginx/blobs/{wrong_digest}",
+            content=content,
+        )
+        client = RegistryClient()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(DigestMismatchError):
+                client.download_blob("registry-1.docker.io", "library/nginx", wrong_digest, tmpdir)

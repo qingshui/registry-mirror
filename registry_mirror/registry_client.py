@@ -220,3 +220,34 @@ class RegistryClient:
             manifest = resp.json()
 
         return manifest
+
+    def download_blob(self, registry, repository, digest, tmpdir):
+        """下载 Blob 到临时文件，校验 digest。"""
+        url = self._api_url(registry, f"/{repository}/blobs/{digest}")
+        filepath = os.path.join(tmpdir, digest.replace(":", "_"))
+
+        for attempt in range(3):
+            try:
+                resp = self._request_with_auth("GET", url, registry, repository, stream=True)
+                resp.raise_for_status()
+
+                hasher = hashlib.sha256()
+                with open(filepath, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            hasher.update(chunk)
+
+                actual_digest = f"sha256:{hasher.hexdigest()}"
+                if actual_digest != digest:
+                    os.remove(filepath)
+                    raise DigestMismatchError(
+                        f"Blob digest 不匹配: 期望 {digest}, 实际 {actual_digest}"
+                    )
+                return filepath
+
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
