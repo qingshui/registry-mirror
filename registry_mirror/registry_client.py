@@ -76,3 +76,75 @@ def parse_image_name(image: str) -> tuple:
 
     reference = digest if digest else tag
     return (registry, repository, reference)
+
+
+def parse_www_authenticate(header: str) -> tuple:
+    """解析 WWW-Authenticate 头。"""
+    match = re.match(r"(Bearer|Basic)\s+(.+)", header, re.IGNORECASE)
+    if not match:
+        return (header.lower(), {})
+
+    auth_type = match.group(1).lower()
+    params_str = match.group(2)
+
+    params = {}
+    for m in re.finditer(r'(\w+)="([^"]*)"', params_str):
+        params[m.group(1)] = m.group(2)
+
+    return (auth_type, params)
+
+
+class RegistryClient:
+    """Docker Registry V2 API 客户端。"""
+
+    def __init__(self, username=None, password=None, proxy=None):
+        self.session = requests.Session()
+        self.username = username
+        self.password = password
+        self._token_cache = {}
+
+        if proxy:
+            self.session.proxies = {
+                "http": proxy,
+                "https": proxy,
+            }
+
+    def _get_bearer_token(self, realm, service, scope):
+        """获取 Bearer Token。"""
+        params = {
+            "service": service,
+            "scope": scope,
+        }
+        if self.username and self.password:
+            resp = self.session.get(realm, params=params, auth=(self.username, self.password))
+        else:
+            resp = self.session.get(realm, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("token") or data.get("access_token")
+
+    def _auth_for_scope(self, registry, repository, www_authenticate, force_refresh=False):
+        """根据 WWW-Authenticate 头进行认证。"""
+        auth_type, params = parse_www_authenticate(www_authenticate)
+
+        if auth_type == "bearer":
+            scope = params.get("scope", f"repository:{repository}:pull")
+            cache_key = (registry, repository, scope)
+
+            if not force_refresh and cache_key in self._token_cache:
+                return self._token_cache[cache_key]
+
+            token = self._get_bearer_token(
+                realm=params["realm"],
+                service=params.get("service", ""),
+                scope=scope,
+            )
+            self._token_cache[cache_key] = token
+            return token
+        elif auth_type == "basic":
+            if not self.username or not self.password:
+                raise ValueError("此 Registry 需要 Basic 认证，请提供 --user 和 --password-stdin")
+            self.session.auth = (self.username, self.password)
+            return None
+        else:
+            raise ValueError(f"不支持的认证方式: {auth_type}")
