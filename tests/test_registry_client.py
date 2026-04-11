@@ -90,3 +90,94 @@ class TestRegistryAuth:
             force_refresh=True,
         )
         assert token == "new-token-456"
+
+
+class TestFetchManifest:
+    def test_fetch_manifest_v2(self, requests_mock):
+        from registry_mirror.registry_client import RegistryClient
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 100, "digest": "sha256:aaa"},
+            "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": 200, "digest": "sha256:bbb"}],
+        }
+        requests_mock.get(
+            "https://registry-1.docker.io/v2/library/nginx/manifests/latest",
+            json=manifest,
+            headers={"Content-Type": "application/vnd.docker.distribution.manifest.v2+json"},
+        )
+        client = RegistryClient()
+        result = client.fetch_manifest("registry-1.docker.io", "library/nginx", "latest")
+        assert result["config"]["digest"] == "sha256:aaa"
+        assert len(result["layers"]) == 1
+
+    def test_fetch_manifest_with_auth_retry(self, requests_mock):
+        from registry_mirror.registry_client import RegistryClient
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 100, "digest": "sha256:aaa"},
+            "layers": [],
+        }
+        requests_mock.get(
+            "https://registry.example.com/v2/myimg/manifests/v1",
+            [
+                {"status_code": 401, "headers": {"WWW-Authenticate": 'Bearer realm="https://auth.example.com/token",service="registry.example.com",scope="repository:myimg:pull"'}},
+                {"json": manifest, "headers": {"Content-Type": "application/vnd.docker.distribution.manifest.v2+json"}},
+            ],
+        )
+        requests_mock.get(
+            "https://auth.example.com/token",
+            json={"token": "test-bearer-token"},
+        )
+        client = RegistryClient()
+        result = client.fetch_manifest("registry.example.com", "myimg", "v1")
+        assert result["config"]["digest"] == "sha256:aaa"
+
+    def test_fetch_manifest_list_resolves_platform(self, requests_mock):
+        from registry_mirror.registry_client import RegistryClient
+        manifest_list = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [
+                {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "digest": "sha256:amd64digest", "platform": {"architecture": "amd64", "os": "linux"}},
+                {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "digest": "sha256:arm64digest", "platform": {"architecture": "arm64", "os": "linux"}},
+            ],
+        }
+        manifest_v2 = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 100, "digest": "sha256:aaa"},
+            "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": 200, "digest": "sha256:bbb"}],
+        }
+        requests_mock.get(
+            "https://registry-1.docker.io/v2/library/nginx/manifests/latest",
+            json=manifest_list,
+            headers={"Content-Type": "application/vnd.docker.distribution.manifest.list.v2+json"},
+        )
+        requests_mock.get(
+            "https://registry-1.docker.io/v2/library/nginx/manifests/sha256:amd64digest",
+            json=manifest_v2,
+            headers={"Content-Type": "application/vnd.docker.distribution.manifest.v2+json"},
+        )
+        client = RegistryClient()
+        result = client.fetch_manifest("registry-1.docker.io", "library/nginx", "latest", platform="linux/amd64")
+        assert result["config"]["digest"] == "sha256:aaa"
+
+    def test_fetch_manifest_list_no_matching_platform(self, requests_mock):
+        from registry_mirror.registry_client import RegistryClient
+        manifest_list = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [
+                {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "digest": "sha256:amd64digest", "platform": {"architecture": "amd64", "os": "linux"}},
+            ],
+        }
+        requests_mock.get(
+            "https://registry-1.docker.io/v2/library/nginx/manifests/latest",
+            json=manifest_list,
+            headers={"Content-Type": "application/vnd.docker.distribution.manifest.list.v2+json"},
+        )
+        client = RegistryClient()
+        with pytest.raises(ValueError, match="平台"):
+            client.fetch_manifest("registry-1.docker.io", "library/nginx", "latest", platform="linux/arm64")

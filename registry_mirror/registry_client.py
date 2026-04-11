@@ -148,3 +148,75 @@ class RegistryClient:
             return None
         else:
             raise ValueError(f"不支持的认证方式: {auth_type}")
+
+    MANIFEST_ACCEPT_HEADERS = {
+        "Accept": (
+            "application/vnd.docker.distribution.manifest.v2+json,"
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        )
+    }
+
+    def _api_url(self, registry, path):
+        """构造 Registry API URL。"""
+        return f"https://{registry}/v2{path}"
+
+    def _request_with_auth(self, method, url, registry, repository, **kwargs):
+        """带认证的请求，自动处理 401 和 token 过期。"""
+        headers = kwargs.pop("headers", {})
+
+        # 尝试使用缓存的 token
+        for key, token in self._token_cache.items():
+            if key[0] == registry and key[1] == repository and token:
+                headers["Authorization"] = f"Bearer {token}"
+                break
+
+        resp = self.session.request(method, url, headers=headers, **kwargs)
+
+        if resp.status_code == 401:
+            www_auth = resp.headers.get("WWW-Authenticate", "")
+            if www_auth:
+                token = self._auth_for_scope(registry, repository, www_auth)
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                    resp = self.session.request(method, url, headers=headers, **kwargs)
+
+                if resp.status_code == 401 and www_auth:
+                    token = self._auth_for_scope(registry, repository, www_auth, force_refresh=True)
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        resp = self.session.request(method, url, headers=headers, **kwargs)
+
+        return resp
+
+    def fetch_manifest(self, registry, repository, reference, platform="linux/amd64"):
+        """拉取镜像 Manifest。"""
+        url = self._api_url(registry, f"/{repository}/manifests/{reference}")
+        resp = self._request_with_auth("GET", url, registry, repository, headers=self.MANIFEST_ACCEPT_HEADERS)
+        resp.raise_for_status()
+
+        manifest = resp.json()
+        media_type = manifest.get("mediaType", "")
+
+        if media_type == "application/vnd.docker.distribution.manifest.list.v2+json":
+            target_os, target_arch = platform.split("/", 1)
+            matched = None
+            available = []
+            for entry in manifest.get("manifests", []):
+                p = entry.get("platform", {})
+                available.append(f"{p.get('os', '?')}/{p.get('architecture', '?')}")
+                if p.get("os") == target_os and p.get("architecture") == target_arch:
+                    matched = entry
+                    break
+
+            if not matched:
+                raise ValueError(
+                    f"镜像不包含平台 {platform}，可用平台: {', '.join(available)}"
+                )
+
+            digest = matched["digest"]
+            url = self._api_url(registry, f"/{repository}/manifests/{digest}")
+            resp = self._request_with_auth("GET", url, registry, repository, headers=self.MANIFEST_ACCEPT_HEADERS)
+            resp.raise_for_status()
+            manifest = resp.json()
+
+        return manifest
