@@ -26,7 +26,7 @@ registry-mirror myrepo.com/myimg:v1 --user admin --password-stdin < secret.txt
 registry-mirror nginx:latest --proxy http://127.0.0.1:7890
 
 # 使用国内镜像源
-registry-mirror nginx:latest --mirror registry.cn-hangzhou.aliyuncs.com
+registry-mirror nginx:latest --mirror docker.m.daocloud.io
 
 # 指定平台
 registry-mirror nginx:latest --platform linux/arm64

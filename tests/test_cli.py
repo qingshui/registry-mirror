@@ -25,13 +25,21 @@ class TestBuildDefaultOutput:
 
 
 class TestCheckDiskSpace:
-    def test_sufficient_space(self):
+    def test_sufficient_space_streaming(self):
         manifest = {
             "config": {"size": 100},
             "layers": [{"size": 200}],
         }
         import tempfile
-        check_disk_space(manifest, tempfile.gettempdir())
+        check_disk_space(manifest, tempfile.gettempdir(), streaming=True)
+
+    def test_sufficient_space_non_streaming(self):
+        manifest = {
+            "config": {"size": 100},
+            "layers": [{"size": 200}],
+        }
+        import tempfile
+        check_disk_space(manifest, tempfile.gettempdir(), streaming=False)
 
     def test_insufficient_space(self):
         manifest = {
@@ -40,5 +48,5 @@ class TestCheckDiskSpace:
         }
         import tempfile
         with pytest.raises(SystemExit) as exc_info:
-            check_disk_space(manifest, tempfile.gettempdir())
+            check_disk_space(manifest, tempfile.gettempdir(), streaming=True)
         assert exc_info.value.code == 3
