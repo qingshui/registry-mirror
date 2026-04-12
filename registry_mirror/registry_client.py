@@ -152,7 +152,9 @@ class RegistryClient:
     MANIFEST_ACCEPT_HEADERS = {
         "Accept": (
             "application/vnd.docker.distribution.manifest.v2+json,"
-            "application/vnd.docker.distribution.manifest.list.v2+json"
+            "application/vnd.docker.distribution.manifest.list.v2+json,"
+            "application/vnd.oci.image.manifest.v1+json,"
+            "application/vnd.oci.image.index.v1+json"
         )
     }
 
@@ -197,7 +199,11 @@ class RegistryClient:
         manifest = resp.json()
         media_type = manifest.get("mediaType", "")
 
-        if media_type == "application/vnd.docker.distribution.manifest.list.v2+json":
+        # 多架构索引：Docker Manifest List 或 OCI Image Index
+        if media_type in (
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            "application/vnd.oci.image.index.v1+json",
+        ):
             target_os, target_arch = platform.split("/", 1)
             matched = None
             available = []

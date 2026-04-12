@@ -128,7 +128,8 @@ def main():
     signal.signal(signal.SIGINT, sigint_handler)
     atexit.register(cleanup)
 
-    tmpdir = tempfile.mkdtemp(prefix="registry-mirror-")
+    # 临时目录放在输出文件所在目录，避免跨分区占用额外空间
+    tmpdir = tempfile.mkdtemp(prefix=".registry-mirror-tmp-", dir=output_dir)
     tmpdir_ref[0] = tmpdir
 
     try:
