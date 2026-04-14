@@ -75,7 +75,14 @@ def check_disk_space(manifest, output_dir, streaming=True):
 
 
 def docker_load(tar_path):
-    """执行 docker load 导入镜像。"""
+    """执行 docker load 导入镜像。
+
+    Returns:
+        True 如果导入成功，False 如果 docker 未安装
+
+    Raises:
+        SystemExit: 如果 docker load 执行失败
+    """
     try:
         result = subprocess.run(
             ["docker", "load", "-i", tar_path],
@@ -86,6 +93,7 @@ def docker_load(tar_path):
             print(f"docker load 失败: {result.stderr}", file=sys.stderr)
             sys.exit(EXIT_DOCKER_LOAD_ERROR)
         print(result.stdout)
+        return True
     except FileNotFoundError:
         print(
             "警告: docker 未安装，无法执行 docker load。"
@@ -95,24 +103,26 @@ def docker_load(tar_path):
         sys.exit(EXIT_DOCKER_LOAD_ERROR)
 
 
-def main():
-    """命令行主入口。"""
-    parser = argparse.ArgumentParser(
-        prog="registry-mirror",
-        description="Docker 镜像离线导出工具 — 从远端 Registry 拉取镜像并保存为本地 tar 文件",
-    )
+def _add_common_args(parser):
+    """为子命令添加公共参数。"""
     parser.add_argument("image", help="Docker 镜像名 (如 nginx:latest, registry.example.com/myimg:v1)")
-    parser.add_argument("-o", "--output", help="输出文件路径 (默认: <镜像名>.tar)")
     parser.add_argument("--user", help="Registry 用户名")
     parser.add_argument("--password-stdin", action="store_true", help="从 stdin 读取密码")
     parser.add_argument("--proxy", help="HTTP/HTTPS 代理地址")
     parser.add_argument("--mirror", help="镜像源地址 (仅替代 Docker Hub)")
     parser.add_argument("--platform", default="linux/amd64", help="目标平台 (默认: linux/amd64)")
-    parser.add_argument("--load", action="store_true", help="导出后自动 docker load")
     parser.add_argument("--no-streaming", action="store_true", help="禁用流式组装（回退到先下载全部再组装的模式）")
 
-    args = parser.parse_args()
 
+def _pull_image(args, output_path, load_after=False, cleanup_tar_on_success=False):
+    """拉取镜像并导出为 tar 文件的核心逻辑。
+
+    Args:
+        args: 解析后的命令行参数
+        output_path: 输出 tar 文件路径
+        load_after: 是否在导出后执行 docker load
+        cleanup_tar_on_success: 是否在 docker load 成功后删除 tar 文件
+    """
     password = None
     if args.password_stdin:
         password = sys.stdin.read().strip()
@@ -130,7 +140,6 @@ def main():
         else:
             print(f"警告: --mirror 仅对 Docker Hub 镜像生效，已忽略", file=sys.stderr)
 
-    output_path = args.output or build_default_output(args.image)
     output_dir = os.path.dirname(os.path.abspath(output_path))
 
     tmpdir_ref = [None]
@@ -208,8 +217,11 @@ def main():
         print(f"SHA256: {tar_digest}")
         tar_finished[0] = True
 
-        if args.load:
+        if load_after:
             docker_load(output_path)
+            if cleanup_tar_on_success:
+                os.remove(output_path)
+                print(f"已清理临时文件: {output_path}")
 
     except DigestMismatchError as e:
         print(f"错误: {e}", file=sys.stderr)
@@ -234,6 +246,68 @@ def main():
             sys.exit(EXIT_DOWNLOAD_ERROR)
     finally:
         cleanup()
+
+
+def cmd_save(args):
+    """save 子命令：拉取镜像并保存为 tar 文件。"""
+    output_path = args.output or build_default_output(args.image)
+    _pull_image(args, output_path, load_after=args.load, cleanup_tar_on_success=False)
+
+
+def cmd_pull(args):
+    """pull 子命令：拉取镜像并直接导入 Docker。"""
+    # pull 模式使用临时 tar 文件，导入成功后自动清理
+    output_dir = os.getcwd()
+    output_path = os.path.join(
+        tempfile.mkdtemp(prefix=".registry-mirror-tmp-", dir=output_dir),
+        build_default_output(args.image),
+    )
+    _pull_image(args, output_path, load_after=True, cleanup_tar_on_success=True)
+
+
+def main():
+    """命令行主入口。"""
+    parser = argparse.ArgumentParser(
+        prog="registry-mirror",
+        description="Docker 镜像离线导出工具 — 从远端 Registry 拉取镜像并保存为本地 tar 文件",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # save 子命令（默认行为）
+    save_parser = subparsers.add_parser("save", help="拉取镜像并保存为 tar 文件")
+    _add_common_args(save_parser)
+    save_parser.add_argument("-o", "--output", help="输出文件路径 (默认: <镜像名>.tar)")
+    save_parser.add_argument("--load", action="store_true", help="导出后自动 docker load")
+    save_parser.set_defaults(func=cmd_save)
+
+    # pull 子命令（下载并导入 Docker）
+    pull_parser = subparsers.add_parser("pull", help="拉取镜像并直接导入 Docker")
+    _add_common_args(pull_parser)
+    pull_parser.set_defaults(func=cmd_pull)
+
+    # 向后兼容：无子命令时，直接传镜像名作为 save
+    args = parser.parse_args()
+
+    if args.command is None:
+        # 无子命令，重新解析为 save 模式
+        parser2 = argparse.ArgumentParser(
+            prog="registry-mirror",
+            description="Docker 镜像离线导出工具 — 从远端 Registry 拉取镜像并保存为本地 tar 文件",
+        )
+        parser2.add_argument("image", help="Docker 镜像名 (如 nginx:latest, registry.example.com/myimg:v1)")
+        parser2.add_argument("-o", "--output", help="输出文件路径 (默认: <镜像名>.tar)")
+        parser2.add_argument("--user", help="Registry 用户名")
+        parser2.add_argument("--password-stdin", action="store_true", help="从 stdin 读取密码")
+        parser2.add_argument("--proxy", help="HTTP/HTTPS 代理地址")
+        parser2.add_argument("--mirror", help="镜像源地址 (仅替代 Docker Hub)")
+        parser2.add_argument("--platform", default="linux/amd64", help="目标平台 (默认: linux/amd64)")
+        parser2.add_argument("--load", action="store_true", help="导出后自动 docker load")
+        parser2.add_argument("--no-streaming", action="store_true", help="禁用流式组装（回退到先下载全部再组装的模式）")
+        args = parser2.parse_args()
+        output_path = args.output or build_default_output(args.image)
+        _pull_image(args, output_path, load_after=args.load, cleanup_tar_on_success=False)
+    else:
+        args.func(args)
 
 
 if __name__ == "__main__":
