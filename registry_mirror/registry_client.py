@@ -1,11 +1,15 @@
 """Docker Registry V2 API 客户端"""
 
+import base64
 import hashlib
+import json
 import os
 import re
 import time
 
 import requests
+
+from registry_mirror.image_builder import digest_to_blob_filename
 
 
 DOCKER_HUB_REGISTRY = "registry-1.docker.io"
@@ -97,11 +101,12 @@ def parse_www_authenticate(header: str) -> tuple:
 class RegistryClient:
     """Docker Registry V2 API 客户端。"""
 
-    def __init__(self, username=None, password=None, proxy=None):
+    def __init__(self, username=None, password=None, proxy=None, insecure=False):
         self.session = requests.Session()
         self.username = username
         self.password = password
         self._token_cache = {}
+        self._insecure = insecure
 
         if proxy:
             self.session.proxies = {
@@ -110,7 +115,11 @@ class RegistryClient:
             }
 
     def _get_bearer_token(self, realm, service, scope):
-        """获取 Bearer Token。"""
+        """获取 Bearer Token。
+
+        Returns:
+            (token, expiry_timestamp) 元组
+        """
         params = {
             "service": service,
             "scope": scope,
@@ -121,7 +130,24 @@ class RegistryClient:
             resp = self.session.get(realm, params=params)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("token") or data.get("access_token")
+        token = data.get("token") or data.get("access_token")
+
+        # 确定过期时间
+        expires_in = data.get("expires_in", 300)  # 默认 5 分钟
+        # 尝试从 JWT exp 声明中获取更准确的过期时间
+        try:
+            payload_b64 = token.split(".")[1]
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            if "exp" in payload:
+                jwt_expires_in = payload["exp"] - time.time()
+                if jwt_expires_in > 0:
+                    expires_in = min(expires_in, jwt_expires_in)
+        except Exception:
+            pass
+
+        expiry = time.time() + expires_in - 30  # 30 秒安全裕量
+        return token, expiry
 
     def _auth_for_scope(self, registry, repository, www_authenticate, force_refresh=False):
         """根据 WWW-Authenticate 头进行认证。"""
@@ -132,14 +158,17 @@ class RegistryClient:
             cache_key = (registry, repository, scope)
 
             if not force_refresh and cache_key in self._token_cache:
-                return self._token_cache[cache_key]
+                token, expiry = self._token_cache[cache_key]
+                if time.time() < expiry:
+                    return token
+                # Token 过期，继续刷新
 
-            token = self._get_bearer_token(
+            token, expiry = self._get_bearer_token(
                 realm=params["realm"],
                 service=params.get("service", ""),
                 scope=scope,
             )
-            self._token_cache[cache_key] = token
+            self._token_cache[cache_key] = (token, expiry)
             return token
         elif auth_type == "basic":
             if not self.username or not self.password:
@@ -160,17 +189,24 @@ class RegistryClient:
 
     def _api_url(self, registry, path):
         """构造 Registry API URL。"""
-        return f"https://{registry}/v2{path}"
+        scheme = "https"
+        if self._insecure:
+            scheme = "http"
+        elif registry.startswith("localhost:") or registry.startswith("127.0.0.1:"):
+            scheme = "http"
+        return f"{scheme}://{registry}/v2{path}"
 
     def _request_with_auth(self, method, url, registry, repository, **kwargs):
         """带认证的请求，自动处理 401 和 token 过期。"""
         headers = kwargs.pop("headers", {})
 
-        # 尝试使用缓存的 token
-        for key, token in self._token_cache.items():
-            if key[0] == registry and key[1] == repository and token:
+        # 尝试使用缓存的 token：构造标准 scope key 进行 O(1) 查找
+        possible_scope = f"repository:{repository}:pull"
+        cache_key = (registry, repository, possible_scope)
+        if cache_key in self._token_cache:
+            token, expiry = self._token_cache[cache_key]
+            if time.time() < expiry:
                 headers["Authorization"] = f"Bearer {token}"
-                break
 
         resp = self.session.request(method, url, headers=headers, **kwargs)
 
@@ -227,22 +263,44 @@ class RegistryClient:
 
         return manifest
 
-    def download_blob(self, registry, repository, digest, tmpdir):
-        """下载 Blob 到临时文件，校验 digest。"""
+    def download_blob(self, registry, repository, digest, tmpdir, progress_callback=None):
+        """下载 Blob 到临时文件，校验 digest。
+
+        Args:
+            registry: Registry 主机名
+            repository: 仓库名
+            digest: Blob 的 sha256 digest
+            tmpdir: 临时文件目录
+            progress_callback: 可选回调函数(downloaded_bytes, total_bytes)，
+                                total_bytes 可能为 None
+
+        Returns:
+            下载的文件路径
+
+        Raises:
+            DigestMismatchError: Blob digest 校验失败
+            requests.ConnectionError: 连接失败
+            requests.Timeout: 请求超时
+        """
         url = self._api_url(registry, f"/{repository}/blobs/{digest}")
-        filepath = os.path.join(tmpdir, digest.replace(":", "_"))
+        filepath = os.path.join(tmpdir, digest_to_blob_filename(digest))
 
         for attempt in range(3):
             try:
                 resp = self._request_with_auth("GET", url, registry, repository, stream=True)
                 resp.raise_for_status()
 
+                total_size = int(resp.headers.get("Content-Length", 0)) or None
+                downloaded = 0
                 hasher = hashlib.sha256()
                 with open(filepath, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
                         if chunk:
                             f.write(chunk)
                             hasher.update(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback:
+                                progress_callback(downloaded, total_size)
 
                 actual_digest = f"sha256:{hasher.hexdigest()}"
                 if actual_digest != digest:
@@ -252,7 +310,7 @@ class RegistryClient:
                     )
                 return filepath
 
-            except (requests.ConnectionError, requests.Timeout):
+            except (requests.ConnectionError, requests.Timeout, DigestMismatchError):
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                 else:

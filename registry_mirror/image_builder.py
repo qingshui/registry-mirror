@@ -7,6 +7,45 @@ import os
 import tarfile
 
 
+SHA256_PREFIX = "sha256:"
+_READ_CHUNK_SIZE = 1 << 20  # 1 MB
+
+
+def strip_sha256_prefix(digest: str) -> str:
+    """移除 digest 的 'sha256:' 前缀。"""
+    return digest.replace(SHA256_PREFIX, "")
+
+
+def parse_repo_tag(repo_tag: str) -> tuple:
+    """解析 'name:tag' 为 (repo_name, tag)，tag 默认 'latest'。"""
+    if ":" in repo_tag:
+        repo_name, tag = repo_tag.rsplit(":", 1)
+    else:
+        repo_name = repo_tag
+        tag = "latest"
+    return repo_name, tag
+
+
+def build_manifest_json(config_filename, repo_tag, layer_arcnames):
+    """构建 Docker Image tar 的 manifest.json 条目。"""
+    return {
+        "Config": config_filename,
+        "RepoTags": [repo_tag],
+        "Layers": layer_arcnames,
+    }
+
+
+def build_repositories_json(repo_tag, first_layer_hash):
+    """构建 Docker Image tar 的 repositories 字典。"""
+    repo_name, tag = parse_repo_tag(repo_tag)
+    return {repo_name: {tag: first_layer_hash}}
+
+
+def digest_to_blob_filename(digest: str) -> str:
+    """将 digest (如 sha256:abc) 转为文件系统安全的文件名 (如 sha256_abc)。"""
+    return digest.replace(":", "_")
+
+
 def build_image_tar(manifest, blob_dir, output_path, repo_tag):
     """将下载的 blob 组装为 Docker Image tar 文件。
 
@@ -22,40 +61,27 @@ def build_image_tar(manifest, blob_dir, output_path, repo_tag):
     config_digest = manifest["config"]["digest"]
     layer_digests = [layer["digest"] for layer in manifest["layers"]]
 
-    config_hash = config_digest.replace("sha256:", "")
+    config_hash = strip_sha256_prefix(config_digest)
     config_filename = f"{config_hash}.json"
 
     layer_entries = []
     for digest in layer_digests:
-        layer_hash = digest.replace("sha256:", "")
+        layer_hash = strip_sha256_prefix(digest)
         layer_entries.append((digest, layer_hash, f"{layer_hash}/layer.tar"))
 
-    image_manifest = {
-        "Config": config_filename,
-        "RepoTags": [repo_tag],
-        "Layers": [entry[2] for entry in layer_entries],
-    }
+    image_manifest = build_manifest_json(
+        config_filename, repo_tag, [entry[2] for entry in layer_entries]
+    )
 
-    if ":" in repo_tag:
-        repo_name, tag = repo_tag.rsplit(":", 1)
-    else:
-        repo_name = repo_tag
-        tag = "latest"
-
-    first_layer_hash = layer_digests[0].replace("sha256:", "") if layer_digests else ""
-
-    repositories = {
-        repo_name: {
-            tag: first_layer_hash,
-        }
-    }
+    first_layer_hash = strip_sha256_prefix(layer_digests[0]) if layer_digests else ""
+    repositories = build_repositories_json(repo_tag, first_layer_hash)
 
     with tarfile.open(output_path, "w") as tar:
-        config_blob_path = os.path.join(blob_dir, config_digest.replace(":", "_"))
+        config_blob_path = os.path.join(blob_dir, digest_to_blob_filename(config_digest))
         tar.add(config_blob_path, arcname=config_filename)
 
         for digest, layer_hash, arcname in layer_entries:
-            layer_blob_path = os.path.join(blob_dir, digest.replace(":", "_"))
+            layer_blob_path = os.path.join(blob_dir, digest_to_blob_filename(digest))
             dir_info = tarfile.TarInfo(name=layer_hash)
             dir_info.type = tarfile.DIRTYPE
             dir_info.mode = 0o755
@@ -74,7 +100,7 @@ def build_image_tar(manifest, blob_dir, output_path, repo_tag):
 
     hasher = hashlib.sha256()
     with open(output_path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(_READ_CHUNK_SIZE), b""):
             hasher.update(chunk)
 
     return f"sha256:{hasher.hexdigest()}"
@@ -112,6 +138,17 @@ class StreamingImageBuilder:
         self._layer_entries = []
         self._state = self._STATE_INIT
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._tar is not None and self._state != self._STATE_FINISHED:
+            self._tar.close()
+            # 清理不完整的输出文件
+            if os.path.exists(self._output_path):
+                os.remove(self._output_path)
+        return False
+
     def add_config(self, config_blob_path, config_digest):
         """写入 config json 条目。
 
@@ -124,7 +161,7 @@ class StreamingImageBuilder:
         """
         if self._state != self._STATE_INIT:
             raise RuntimeError("add_config 必须首先调用，且只能调用一次")
-        config_hash = config_digest.replace("sha256:", "")
+        config_hash = strip_sha256_prefix(config_digest)
         config_filename = f"{config_hash}.json"
         self._tar.add(config_blob_path, arcname=config_filename)
         self._config_filename = config_filename
@@ -142,7 +179,7 @@ class StreamingImageBuilder:
         """
         if self._state != self._STATE_CONFIG_ADDED:
             raise RuntimeError("add_layer 必须在 add_config 之后调用")
-        layer_hash = layer_digest.replace("sha256:", "")
+        layer_hash = strip_sha256_prefix(layer_digest)
         arcname = f"{layer_hash}/layer.tar"
 
         dir_info = tarfile.TarInfo(name=layer_hash)
@@ -167,23 +204,11 @@ class StreamingImageBuilder:
 
         first_layer_hash = self._layer_entries[0][1] if self._layer_entries else ""
 
-        image_manifest = {
-            "Config": self._config_filename,
-            "RepoTags": [self._repo_tag],
-            "Layers": [entry[2] for entry in self._layer_entries],
-        }
-
-        if ":" in self._repo_tag:
-            repo_name, tag = self._repo_tag.rsplit(":", 1)
-        else:
-            repo_name = self._repo_tag
-            tag = "latest"
-
-        repositories = {
-            repo_name: {
-                tag: first_layer_hash,
-            }
-        }
+        image_manifest = build_manifest_json(
+            self._config_filename, self._repo_tag,
+            [entry[2] for entry in self._layer_entries],
+        )
+        repositories = build_repositories_json(self._repo_tag, first_layer_hash)
 
         manifest_bytes = json.dumps([image_manifest]).encode()
         manifest_info = tarfile.TarInfo(name="manifest.json")
@@ -200,6 +225,6 @@ class StreamingImageBuilder:
 
         hasher = hashlib.sha256()
         with open(self._output_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
+            for chunk in iter(lambda: f.read(_READ_CHUNK_SIZE), b""):
                 hasher.update(chunk)
         return f"sha256:{hasher.hexdigest()}"

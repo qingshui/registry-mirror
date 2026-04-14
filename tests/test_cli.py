@@ -1,8 +1,16 @@
 import os
+import subprocess
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
-from registry_mirror.cli import sanitize_filename, build_default_output, check_disk_space
+from registry_mirror.cli import (
+    sanitize_filename,
+    build_default_output,
+    check_disk_space,
+    docker_load,
+    EXIT_DOCKER_NOT_FOUND,
+    EXIT_DOCKER_LOAD_ERROR,
+)
 
 
 class TestSanitizeFilename:
@@ -50,3 +58,22 @@ class TestCheckDiskSpace:
         with pytest.raises(SystemExit) as exc_info:
             check_disk_space(manifest, tempfile.gettempdir(), streaming=True)
         assert exc_info.value.code == 3
+
+
+class TestDockerLoadExitCodes:
+    def test_docker_not_found_exits_5(self):
+        """docker 未安装时应使用退出码 5。"""
+        with patch("registry_mirror.cli.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(SystemExit) as exc_info:
+                docker_load("/tmp/test.tar")
+            assert exc_info.value.code == EXIT_DOCKER_NOT_FOUND
+
+    def test_docker_load_failure_exits_4(self):
+        """docker load 失败时应使用退出码 4。"""
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "load error"
+        with patch("registry_mirror.cli.subprocess.run", return_value=mock_result):
+            with pytest.raises(SystemExit) as exc_info:
+                docker_load("/tmp/test.tar")
+            assert exc_info.value.code == EXIT_DOCKER_LOAD_ERROR
